@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -433,6 +434,25 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+GREETING = (
+    "Привіт! Я слідкуватиму за посиланнями на квартири 🏠\n\n"
+    "• нове посилання тихенько відмічаю 👌\n"
+    "• якщо посилання вже кидали — попереджу і запропоную видалити повторку\n"
+    "• /check — перевірю, чи оголошення ще актуальні (і сам роблю це щодня о 10:00)\n"
+    "• /list — покажу все збережене\n\n"
+    "Щоб я бачив усі повідомлення і міг видаляти повторки, зробіть мене "
+    "адміністратором з правом «Видалення повідомлень» 🙏"
+)
+
+
+async def on_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Вітається, коли бота додають у групу."""
+    message = update.effective_message
+    if message and message.new_chat_members:
+        if any(m.id == context.bot.id for m in message.new_chat_members):
+            await message.reply_text(GREETING)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привіт! Я слідкую, щоб у групі не було повторних посилань на квартири 🏠\n\n"
@@ -456,9 +476,21 @@ def main() -> None:
 
     init_db()
 
-    app = Application.builder().token(token).build()
+    async def post_init(app: Application) -> None:
+        # кнопка меню «/» зі списком команд біля поля вводу
+        await app.bot.set_my_commands(
+            [
+                BotCommand("check", "перевірити, чи оголошення ще актуальні"),
+                BotCommand("list", "показати всі збережені посилання"),
+            ]
+        )
+
+    app = Application.builder().token(token).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_added_to_group)
+    )
     app.add_handler(CommandHandler("check", cmd_check, filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("list", cmd_list, filters.ChatType.GROUPS))
     app.add_handler(CallbackQueryHandler(on_button))
