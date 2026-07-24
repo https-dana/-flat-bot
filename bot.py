@@ -248,24 +248,67 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
-    warning = query.message
+    data = query.data
 
-    if query.data.startswith("rm:"):
-        dup_message_id = int(query.data.split(":", 1)[1])
+    # кнопки під попередженням про повторку
+    if data == "keep" or data.startswith("rm:"):
+        warning = query.message
+        if data.startswith("rm:"):
+            dup_message_id = int(data.split(":", 1)[1])
+            try:
+                await context.bot.delete_message(warning.chat_id, dup_message_id)
+            except Exception as exc:
+                await query.answer(
+                    "Не зміг видалити 😔 Перевір, чи я адмін з правом видаляти повідомлення.",
+                    show_alert=True,
+                )
+                log.warning("Не вдалося видалити повідомлення: %s", exc)
+                return
+        await query.answer()
         try:
-            await context.bot.delete_message(warning.chat_id, dup_message_id)
+            await warning.delete()
+        except Exception:
+            pass
+        return
+
+    # кнопки «видалити неактуальне» під звітом перевірки
+    if data.startswith("rmdead:"):
+        link_id = int(data.split(":", 1)[1])
+        with db() as conn:
+            row = conn.execute(
+                "SELECT * FROM links WHERE id = ?", (link_id,)
+            ).fetchone()
+        if not row or not row["message_id"]:
+            await query.answer("Не знайшов оригінальне повідомлення 🤷", show_alert=True)
+            return
+        try:
+            await context.bot.delete_message(row["chat_id"], row["message_id"])
         except Exception as exc:
             await query.answer(
-                "Не зміг видалити 😔 Перевір, чи я адмін з правом видаляти повідомлення.",
+                "Не зміг видалити 😔 Можливо, повідомлення вже видалене, "
+                "або в мене немає права видаляти.",
                 show_alert=True,
             )
             log.warning("Не вдалося видалити повідомлення: %s", exc)
             return
-    try:
-        await warning.delete()
-    except Exception:
-        pass
+        await query.answer("Видалив ✅")
+        # прибираємо натиснуту кнопку зі звіту
+        markup = query.message.reply_markup
+        if markup:
+            remaining = [
+                row_kb
+                for row_kb in markup.inline_keyboard
+                if not any(btn.callback_data == data for btn in row_kb)
+            ]
+            try:
+                await query.edit_message_reply_markup(
+                    InlineKeyboardMarkup(remaining) if remaining else None
+                )
+            except Exception:
+                pass
+        return
+
+    await query.answer()
 
 
 # ---------------------------------------------------------------- перевірка актуальності
@@ -324,9 +367,9 @@ async def check_one(client: httpx.AsyncClient, url: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-async def run_check(chat_id: int) -> str | None:
-    """Перевіряє всі активні посилання чату. Повертає текст звіту
-    або None, якщо перевіряти нічого."""
+async def run_check(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None] | None:
+    """Перевіряє всі активні посилання чату. Повертає (текст звіту, кнопки
+    для видалення неактуальних) або None, якщо перевіряти нічого."""
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM links WHERE chat_id = ? AND is_active = 1", (chat_id,)
@@ -357,28 +400,43 @@ async def run_check(chat_id: int) -> str | None:
                 dead.append((row, reason))
 
     report = [f"🔍 Перевірено посилань: {len(rows)}"]
+    buttons = []
     if dead:
         report.append(f"❌ Неактуальних: {len(dead)}\n")
-        for row, reason in dead:
+        for i, (row, reason) in enumerate(dead, start=1):
             report.append(
-                f'• {html.escape(row["url_orig"])}\n'
+                f'{i}. {html.escape(row["url_orig"])}\n'
                 f'  ↳ кидав(ла) {html.escape(row["posted_by"] or "?")} — {reason}'
             )
-        report.append("\nЦі посилання я позначив неактуальними.")
+            if row["message_id"]:
+                host = urlsplit(row["url_orig"]).netloc
+                host = host[4:] if host.startswith("www.") else host
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"🗑 Видалити №{i} ({host})",
+                            callback_data=f"rmdead:{row['id']}",
+                        )
+                    ]
+                )
+        if buttons:
+            report.append("\nКнопками нижче можна прибрати їх з чату.")
     else:
         report.append("✅ Всі оголошення ще актуальні!")
-    return "\n".join(report)
+    return "\n".join(report), InlineKeyboardMarkup(buttons) if buttons else None
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     progress = await update.effective_message.reply_text("🔍 Перевіряю посилання…")
-    report = await run_check(update.effective_chat.id)
-    if report is None:
+    result = await run_check(update.effective_chat.id)
+    if result is None:
         await progress.edit_text("Поки що я не зберіг жодного посилання в цій групі.")
         return
+    text, keyboard = result
     await progress.edit_text(
-        report,
+        text,
         parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -391,13 +449,15 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             for r in conn.execute("SELECT DISTINCT chat_id FROM links").fetchall()
         ]
     for chat_id in chat_ids:
-        report = await run_check(chat_id)
-        if report and "❌" in report:
+        result = await run_check(chat_id)
+        if result and "❌" in result[0]:
+            text, keyboard = result
             try:
                 await context.bot.send_message(
                     chat_id,
-                    report,
+                    text,
                     parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception as exc:
