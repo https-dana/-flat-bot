@@ -16,7 +16,9 @@ import html
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime, time as dtime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -67,22 +69,47 @@ def load_env() -> None:
 
 # ---------------------------------------------------------------- база даних
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class Store:
+    """Сховище посилань: локально — SQLite-файл, на хостингу — Postgres
+    (якщо задано DATABASE_URL), щоб база переживала перезапуски."""
 
+    def __init__(self) -> None:
+        self.pg_url = os.environ.get("DATABASE_URL")
 
-def init_db() -> None:
-    with db() as conn:
-        conn.execute(
-            """
+    def _connect(self):
+        if self.pg_url:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            return psycopg.connect(self.pg_url, row_factory=dict_row)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _run(self, sql: str, params: tuple = (), fetch: str | None = None):
+        if self.pg_url:
+            sql = sql.replace("?", "%s")
+        conn = self._connect()
+        try:
+            with conn:
+                cur = conn.execute(sql, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+        finally:
+            conn.close()
+
+    def init(self) -> None:
+        id_col = "BIGSERIAL PRIMARY KEY" if self.pg_url else "INTEGER PRIMARY KEY"
+        self._run(
+            f"""
             CREATE TABLE IF NOT EXISTS links (
-                id          INTEGER PRIMARY KEY,
-                chat_id     INTEGER NOT NULL,
-                url_norm    TEXT    NOT NULL,
-                url_orig    TEXT    NOT NULL,
-                message_id  INTEGER,
+                id          {id_col},
+                chat_id     BIGINT NOT NULL,
+                url_norm    TEXT   NOT NULL,
+                url_orig    TEXT   NOT NULL,
+                message_id  BIGINT,
                 posted_by   TEXT,
                 posted_at   TEXT,
                 is_active   INTEGER DEFAULT 1,
@@ -91,6 +118,49 @@ def init_db() -> None:
             )
             """
         )
+
+    def find_link(self, chat_id: int, url_norm: str):
+        return self._run(
+            "SELECT * FROM links WHERE chat_id = ? AND url_norm = ?",
+            (chat_id, url_norm),
+            fetch="one",
+        )
+
+    def add_link(self, chat_id, url_norm, url_orig, message_id, posted_by, posted_at):
+        self._run(
+            """INSERT INTO links
+               (chat_id, url_norm, url_orig, message_id, posted_by, posted_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (chat_id, url_norm, url_orig, message_id, posted_by, posted_at),
+        )
+
+    def get_link(self, link_id: int):
+        return self._run("SELECT * FROM links WHERE id = ?", (link_id,), fetch="one")
+
+    def active_links(self, chat_id: int):
+        return self._run(
+            "SELECT * FROM links WHERE chat_id = ? AND is_active = 1",
+            (chat_id,),
+            fetch="all",
+        )
+
+    def set_status(self, link_id: int, is_active: int, when: str) -> None:
+        self._run(
+            "UPDATE links SET is_active = ?, last_checked = ? WHERE id = ?",
+            (is_active, when, link_id),
+        )
+
+    def links(self, chat_id: int):
+        return self._run(
+            "SELECT * FROM links WHERE chat_id = ? ORDER BY id", (chat_id,), fetch="all"
+        )
+
+    def chats(self) -> list[int]:
+        rows = self._run("SELECT DISTINCT chat_id FROM links", fetch="all")
+        return [r["chat_id"] for r in rows]
+
+
+store = Store()
 
 
 # ---------------------------------------------------------------- нормалізація URL
@@ -176,29 +246,20 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     posted_by = user.first_name if user else "хтось"
 
     duplicates = []  # (url, рядок з БД)
-    with db() as conn:
-        for url in urls:
-            norm = normalize_url(url)
-            row = conn.execute(
-                "SELECT * FROM links WHERE chat_id = ? AND url_norm = ?",
-                (chat_id, norm),
-            ).fetchone()
-            if row:
-                duplicates.append((url, row))
-            else:
-                conn.execute(
-                    """INSERT INTO links
-                       (chat_id, url_norm, url_orig, message_id, posted_by, posted_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        chat_id,
-                        norm,
-                        url,
-                        message.message_id,
-                        posted_by,
-                        datetime.now(KYIV).isoformat(timespec="seconds"),
-                    ),
-                )
+    for url in urls:
+        norm = normalize_url(url)
+        row = store.find_link(chat_id, norm)
+        if row:
+            duplicates.append((url, row))
+        else:
+            store.add_link(
+                chat_id,
+                norm,
+                url,
+                message.message_id,
+                posted_by,
+                datetime.now(KYIV).isoformat(timespec="seconds"),
+            )
 
     if not duplicates:
         try:
@@ -274,10 +335,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # кнопки «видалити неактуальне» під звітом перевірки
     if data.startswith("rmdead:"):
         link_id = int(data.split(":", 1)[1])
-        with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM links WHERE id = ?", (link_id,)
-            ).fetchone()
+        row = store.get_link(link_id)
         if not row or not row["message_id"]:
             await query.answer("Не знайшов оригінальне повідомлення 🤷", show_alert=True)
             return
@@ -370,10 +428,7 @@ async def check_one(client: httpx.AsyncClient, url: str) -> tuple[bool, str]:
 async def run_check(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None] | None:
     """Перевіряє всі активні посилання чату. Повертає (текст звіту, кнопки
     для видалення неактуальних) або None, якщо перевіряти нічого."""
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM links WHERE chat_id = ? AND is_active = 1", (chat_id,)
-        ).fetchall()
+    rows = store.active_links(chat_id)
     if not rows:
         return None
 
@@ -390,14 +445,10 @@ async def run_check(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None] | N
 
     now = datetime.now(KYIV).isoformat(timespec="seconds")
     dead = []
-    with db() as conn:
-        for row, (alive, reason) in results:
-            conn.execute(
-                "UPDATE links SET is_active = ?, last_checked = ? WHERE id = ?",
-                (1 if alive else 0, now, row["id"]),
-            )
-            if not alive:
-                dead.append((row, reason))
+    for row, (alive, reason) in results:
+        store.set_status(row["id"], 1 if alive else 0, now)
+        if not alive:
+            dead.append((row, reason))
 
     report = [f"🔍 Перевірено посилань: {len(rows)}"]
     buttons = []
@@ -443,12 +494,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def daily_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Щоденна автоперевірка: пише в групу, лише якщо знайшлося щось неактуальне."""
-    with db() as conn:
-        chat_ids = [
-            r["chat_id"]
-            for r in conn.execute("SELECT DISTINCT chat_id FROM links").fetchall()
-        ]
-    for chat_id in chat_ids:
+    for chat_id in store.chats():
         result = await run_check(chat_id)
         if result and "❌" in result[0]:
             text, keyboard = result
@@ -467,11 +513,7 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- інші команди
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM links WHERE chat_id = ? ORDER BY id",
-            (update.effective_chat.id,),
-        ).fetchall()
+    rows = store.links(update.effective_chat.id)
     if not rows:
         await update.effective_message.reply_text(
             "Поки що я не зберіг жодного посилання в цій групі."
@@ -526,6 +568,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------------------------------------------------------- запуск
 
+def start_health_server() -> None:
+    """Крихітний веб-сервер для Render: відповідає «OK» на пінги UptimeRobot,
+    щоб безкоштовний хостинг не присипляв бота. Локально (без PORT) не запускається."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+
+    class Ping(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", int(port)), Ping)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health-сервер слухає порт %s", port)
+
+
 def main() -> None:
     load_env()
     token = os.environ.get("BOT_TOKEN")
@@ -534,7 +602,8 @@ def main() -> None:
             "Не знайдено BOT_TOKEN. Скопіюй .env.example у .env і встав туди токен від @BotFather."
         )
 
-    init_db()
+    store.init()
+    start_health_server()
 
     async def post_init(app: Application) -> None:
         # кнопка меню «/» зі списком команд біля поля вводу
